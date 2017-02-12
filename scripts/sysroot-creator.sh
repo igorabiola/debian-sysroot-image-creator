@@ -63,15 +63,18 @@ readonly RELEASE_LIST_GPG="${REPO_BASEDIR}/${RELEASE_FILE_GPG}"
 readonly PACKAGE_FILE_AMD64="main/binary-amd64/Packages.bz2"
 readonly PACKAGE_FILE_I386="main/binary-i386/Packages.bz2"
 readonly PACKAGE_FILE_ARM="main/binary-armhf/Packages.bz2"
+readonly PACKAGE_FILE_ARM64="main/binary-arm64/Packages.gz"
 readonly PACKAGE_FILE_MIPS="main/binary-mipsel/Packages.bz2"
 readonly PACKAGE_LIST_AMD64="${REPO_BASEDIR}/${PACKAGE_FILE_AMD64}"
 readonly PACKAGE_LIST_I386="${REPO_BASEDIR}/${PACKAGE_FILE_I386}"
 readonly PACKAGE_LIST_ARM="${REPO_BASEDIR}/${PACKAGE_FILE_ARM}"
+readonly PACKAGE_LIST_ARM64="${REPO_BASEDIR}/${PACKAGE_FILE_ARM64}"
 readonly PACKAGE_LIST_MIPS="${REPO_BASEDIR}/${PACKAGE_FILE_MIPS}"
 
 readonly DEBIAN_DEP_LIST_AMD64="packagelist.${DIST}.amd64"
 readonly DEBIAN_DEP_LIST_I386="packagelist.${DIST}.i386"
 readonly DEBIAN_DEP_LIST_ARM="packagelist.${DIST}.arm"
+readonly DEBIAN_DEP_LIST_ARM64="packagelist.${DIST}.arm64"
 readonly DEBIAN_DEP_LIST_MIPS="packagelist.${DIST}.mipsel"
 
 ######################################################################
@@ -127,6 +130,9 @@ SetEnvironmentVariables() {
   fi
   if [ -z "$ARCH" ]; then
     echo $1 | grep -qs ARM$ && ARCH=ARM
+  fi
+  if [ -z "$ARCH" ]; then
+    echo $1 | grep -qs ARM64$ && ARCH=ARM64
   fi
   if [ -z "${ARCH}" ]; then
     echo "ERROR: Unable to determine architecture based on: $1"
@@ -185,6 +191,10 @@ ExtractPackageBz2() {
   bzcat "$1" | egrep '^(Package:|Filename:|SHA256:) ' > "$2"
 }
 
+ExtractPackageGz() {
+  gunzip < "$1" | egrep '^(Package:|Filename:|SHA256:) ' > "$2"
+}
+
 GeneratePackageListAmd64() {
   local output_file="$1"
   local package_list="${BUILD_DIR}/Packages.${DIST}_amd64.bz2"
@@ -214,8 +224,17 @@ GeneratePackageListARM() {
   DownloadOrCopy "${PACKAGE_LIST_ARM}" "${package_list}"
   # VerifyPackageListing "${PACKAGE_FILE_ARM}" "${package_list}"
   ExtractPackageBz2 "$package_list" "$tmp_package_list"
-  GeneratePackageList "$tmp_package_list" "$output_file" "${DEBIAN_PACKAGES}
-    ${DEBIAN_PACKAGES_ARM}"
+  GeneratePackageList "$tmp_package_list" "$output_file" "${DEBIAN_PACKAGES}"
+}
+
+GeneratePackageListARM64() {
+  local output_file="$1"
+  local package_list="${BUILD_DIR}/Packages.${DIST}_arm64.gz"
+  local tmp_package_list="${BUILD_DIR}/Packages.${DIST}_arm64"
+  DownloadOrCopy "${PACKAGE_LIST_ARM64}" "${package_list}"
+  # VerifyPackageListing "${PACKAGE_FILE_ARM}" "${package_list}"
+  ExtractPackageGz "$package_list" "$tmp_package_list"
+  GeneratePackageList "$tmp_package_list" "$output_file" "${DEBIAN_PACKAGES}"
 }
 
 GeneratePackageListMips() {
@@ -317,6 +336,25 @@ HacksAndPatchesARM() {
       ${INSTALL_ROOT}/usr/lib/pkgconfig
 }
 
+HacksAndPatchesARM64() {
+  Banner "Misc Hacks & Patches"
+  # these are linker scripts with absolute pathnames in them
+  # which we rewrite here
+  lscripts="${INSTALL_ROOT}/usr/lib/aarch64-linux-gnu/libpthread.so \
+            ${INSTALL_ROOT}/usr/lib/aarch64-linux-gnu/libc.so"
+
+  # Rewrite linker scripts
+  sed -i -e 's|/usr/lib/aarch64-linux-gnu/||g' ${lscripts}
+  sed -i -e 's|/lib/aarch64-linux-gnu/||g' ${lscripts}
+
+  # This is for chrome's ./build/linux/pkg-config-wrapper
+  # which overwrites PKG_CONFIG_PATH internally
+  SubBanner "Move pkgconfig scripts"
+  mkdir -p ${INSTALL_ROOT}/usr/lib/pkgconfig
+  cp -r ${INSTALL_ROOT}/usr/lib/aarch64-linux-gnu/pkgconfig/* \
+      ${INSTALL_ROOT}/usr/lib/pkgconfig
+}
+
 
 HacksAndPatchesMips() {
   Banner "Misc Hacks & Patches"
@@ -377,12 +415,12 @@ InstallIntoSysroot() {
 
 
 CleanupJailSymlinks() {
-  Banner "Jail symlink cleanup"
+  Banner "Jail symlink cleanup ${ARCH}"
 
   SAVEDPWD=$(pwd)
   cd ${INSTALL_ROOT}
   local libdirs="lib usr/lib"
-  if [ "${ARCH}" != "MIPS" ]; then
+  if [ "${ARCH}" != "MIPS" -a "${ARCH}" != "ARM64" ]; then
     libdirs+=" lib64"
   fi
   find $libdirs -type l -printf '%p %l\n' | while read link target; do
@@ -391,13 +429,13 @@ CleanupJailSymlinks() {
     echo "${link}: ${target}"
     case "${link}" in
       usr/lib/gcc/x86_64-linux-gnu/4.*/* | usr/lib/gcc/i486-linux-gnu/4.*/* | \
-      usr/lib/gcc/arm-linux-gnueabihf/4.*/* | \
+      usr/lib/gcc/arm-linux-gnueabihf/4.*/* | usr/lib/gcc/aarch64-linux-gnu/4.*/* | \
       usr/lib/gcc/mipsel-linux-gnu/4.*/*)
         # Relativize the symlink.
         ln -snfv "../../../../..${target}" "${link}"
         ;;
       usr/lib/x86_64-linux-gnu/* | usr/lib/i386-linux-gnu/* | \
-      usr/lib/arm-linux-gnueabihf/* | usr/lib/mipsel-linux-gnu/* )
+      usr/lib/arm-linux-gnueabihf/* | usr/lib/aarch64-linux-gnu/* | usr/lib/mipsel-linux-gnu/* )
         # Relativize the symlink.
         ln -snfv "../../..${target}" "${link}"
         ;;
@@ -476,6 +514,24 @@ BuildSysrootARM() {
 }
 
 #@
+#@ BuildSysrootARM64
+#@
+#@    Build everything and package it
+BuildSysrootARM64() {
+  ClearInstallDir
+  local package_file="$BUILD_DIR/package_with_sha256sum_arm64"
+  GeneratePackageListARM64 "$package_file"
+  local files_and_sha256sums="$(cat ${package_file})"
+  StripChecksumsFromPackageList "$package_file"
+  VerifyPackageFilesMatch "$package_file" "$DEBIAN_DEP_LIST_ARM64"
+  APT_REPO=${APR_REPO_ARM64:=$APT_REPO}
+  InstallIntoSysroot ${files_and_sha256sums}
+  CleanupJailSymlinks
+  HacksAndPatchesARM64
+  CreateTarBall
+}
+
+#@
 #@ BuildSysrootMips
 #@
 #@    Build everything and package it
@@ -501,6 +557,8 @@ BuildSysrootAll() {
   RunCommand BuildSysrootAmd64
   RunCommand BuildSysrootI386
   RunCommand BuildSysrootARM
+  unCommand BuildSysrootARM64
+  RunCommand BuildSysrootMips
 }
 
 UploadSysroot() {
@@ -511,7 +569,7 @@ UploadSysroot() {
   fi
   set -x
   github-release upload \
-      --user electron \
+      --user atom \
       --repo debian-sysroot-image-creator \
       --tag "v${rev}" \
       --name "${DISTRO}_${DIST}_${ARCH_LOWER}_sysroot.tgz" \
@@ -541,6 +599,13 @@ UploadSysrootARM() {
 }
 
 #@
+#@ UploadSysrootARM64 <revision>
+#@
+UploadSysrootARM64() {
+  UploadSysroot "$@"
+}
+
+#@
 #@ UploadSysrootMips <revision>
 #@
 UploadSysrootMips() {
@@ -559,7 +624,7 @@ UploadSysrootAll() {
   fi
   set -x
   github-release release \
-      --user electron \
+      --user atom \
       --repo debian-sysroot-image-creator \
       --tag "v${rev}" \
       --name "${rev}" \
@@ -568,6 +633,7 @@ UploadSysrootAll() {
   RunCommand UploadSysrootAmd64 "$@"
   RunCommand UploadSysrootI386 "$@"
   RunCommand UploadSysrootARM "$@"
+  RunCommand UploadSysrootARM64 "$@"
 }
 
 #
@@ -679,6 +745,16 @@ UpdatePackageListsARM() {
 }
 
 #@
+#@ UpdatePackageListsARM64
+#@
+#@     Regenerate the package lists such that they contain an up-to-date
+#@     list of URLs within the Debian archive. (For arm64)
+UpdatePackageListsARM64() {
+  GeneratePackageListARM64 "$DEBIAN_DEP_LIST_ARM64"
+  StripChecksumsFromPackageList "$DEBIAN_DEP_LIST_ARM64"
+}
+
+#@
 #@ UpdatePackageListsMips
 #@
 #@     Regenerate the package lists such that they contain an up-to-date
@@ -696,6 +772,7 @@ UpdatePackageListsAll() {
   RunCommand UpdatePackageListsAmd64
   RunCommand UpdatePackageListsI386
   RunCommand UpdatePackageListsARM
+  RunCommand UpdatePackageListsARM64
   RunCommand UpdatePackageListsMips
 }
 
